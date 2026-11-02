@@ -201,7 +201,7 @@ export function buildLaunchCardSvg(launch: FormatLaunchInput): string {
 export async function generateLaunchCardPng(launch: FormatLaunchInput): Promise<Buffer> {
   const svg = buildLaunchCardSvg(launch);
   return sharp(Buffer.from(svg))
-    .png({ compressionLevel: 2 })
+    .png({ compressionLevel: 6 })
     .toBuffer();
 }
 
@@ -343,7 +343,7 @@ export function buildGraduatedCardSvg(grad: TokenGraduation): string {
 export async function generateGraduatedCardPng(grad: TokenGraduation): Promise<Buffer> {
   const svg = buildGraduatedCardSvg(grad);
   return sharp(Buffer.from(svg))
-    .png({ compressionLevel: 2 })
+    .png({ compressionLevel: 6 })
     .toBuffer();
 }
 

@@ -16,8 +16,38 @@
  *   /latest        - receive the full card + alert for the most recent launch
  *   /help          - show available commands
  */
+import dns from 'node:dns';
+import https from 'node:https';
 import { Input, Telegraf, TelegramError, type Context } from 'telegraf';
 import { logger, errorMessage } from '../logger';
+
+// Force IPv4-first DNS & HTTPS agent so large multipart sendPhoto uploads never hit
+// cloud container IPv6 PMTUD blackholes on Render.
+dns.setDefaultResultOrder('ipv4first');
+const telegramIpv4Agent = new https.Agent({
+  keepAlive: true,
+  family: 4,
+  timeout: 15_000,
+});
+
+const SEND_PHOTO_TIMEOUT_MS = 10_000;
+
+function withSendTimeout<T>(promise: Promise<T>, ms: number, label: string): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const timer = setTimeout(() => reject(new Error(`${label} timed out after ${ms}ms`)), ms);
+    timer.unref?.();
+    promise.then(
+      (val) => {
+        clearTimeout(timer);
+        resolve(val);
+      },
+      (err) => {
+        clearTimeout(timer);
+        reject(err);
+      },
+    );
+  });
+}
 import type { Notifier, TokenGraduation, TokenLaunch, UserFilterPrefs } from '../types';
 import type { LaunchWatcher } from '../chain/watcher';
 import {
@@ -119,6 +149,8 @@ interface PreparedLaunchPayload {
   filename: string;
   caption: string;
   inlineKeyboard: { text: string; url: string }[][];
+  cardImageUrl?: string | null;
+  cardImageUrlPromise?: Promise<string | null>;
 }
 
 export class TelegramNotifier implements Notifier {
@@ -134,7 +166,11 @@ export class TelegramNotifier implements Notifier {
     private readonly channelId: string,
     private readonly formatOptions: TelegramNotifierOptions = {},
   ) {
-    this.bot = new Telegraf(token);
+    this.bot = new Telegraf(token, {
+      telegram: {
+        agent: telegramIpv4Agent,
+      },
+    });
     this.postToChannel = formatOptions.postToChannel ?? Boolean(channelId);
     this.userStore = formatOptions.userStore;
   }
@@ -189,11 +225,15 @@ export class TelegramNotifier implements Notifier {
 
     const caption = formatLaunchMessage(launch, this.formatOptions);
     const initialKeyboard = buildLaunchInlineKeyboard(launch, this.formatOptions);
+    const cardImageUrlPromise = pngBuffer
+      ? uploadLaunchCardImage(pngBuffer)
+      : Promise.resolve(null);
     const initialPayload: PreparedLaunchPayload = {
       pngBuffer,
       filename,
       caption,
       inlineKeyboard: initialKeyboard,
+      cardImageUrlPromise,
     };
 
     let cachedPhotoFileId: string | null = null;
@@ -248,7 +288,12 @@ export class TelegramNotifier implements Notifier {
 
   /**
    * Sends the unified single-message alert (PNG card + HTML caption + inline buttons)
-   * to the public channel immediately without waiting for inter-post throttling.
+   * to the public channel immediately:
+   *  1. Tries direct buffer `sendPhoto` over IPv4 (10s timeout).
+   *  2. If multipart buffer upload fails or times out, uses the hosted `cardImageUrl`
+   *     with `sendPhoto(chatId, cardImageUrl)` so Telegram's servers attach the photo directly.
+   *  3. If `sendPhoto` is still rejected, sends `sendMessage` with `prefer_large_media`
+   *     link preview enabled so the card image still appears inside the same message.
    */
   private async deliverChannelUnifiedImmediate(
     chatId: string | number,
@@ -256,14 +301,18 @@ export class TelegramNotifier implements Notifier {
   ): Promise<{ fileId: string | null; messageId: number | null }> {
     if (payload.pngBuffer) {
       try {
-        const msg = await this.bot.telegram.sendPhoto(
-          chatId,
-          Input.fromBuffer(payload.pngBuffer, payload.filename),
-          {
-            caption: payload.caption,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: payload.inlineKeyboard },
-          },
+        const msg = await withSendTimeout(
+          this.bot.telegram.sendPhoto(
+            chatId,
+            Input.fromBuffer(payload.pngBuffer, payload.filename),
+            {
+              caption: payload.caption,
+              parse_mode: 'HTML',
+              reply_markup: { inline_keyboard: payload.inlineKeyboard },
+            },
+          ),
+          SEND_PHOTO_TIMEOUT_MS,
+          'sendPhoto(buffer)',
         );
         return {
           fileId: msg.photo?.at(-1)?.file_id ?? null,
@@ -271,44 +320,52 @@ export class TelegramNotifier implements Notifier {
         };
       } catch (err) {
         logger.warn(
-          `Immediate sendPhoto failed for channel ${chatId} (${errorMessage(err)}); falling back to withRetry`,
+          `Immediate buffer sendPhoto failed for channel ${chatId} (${errorMessage(err)}); trying URL sendPhoto fallback`,
         );
-        try {
-          const msg = await this.withRetry(() =>
-            this.bot.telegram.sendPhoto(
-              chatId,
-              Input.fromBuffer(payload.pngBuffer!, payload.filename),
-              {
+        const cardUrl =
+          payload.cardImageUrl ??
+          (payload.cardImageUrlPromise ? await payload.cardImageUrlPromise : null);
+        if (cardUrl) {
+          payload.cardImageUrl = cardUrl;
+          try {
+            const msg = await withSendTimeout(
+              this.bot.telegram.sendPhoto(chatId, cardUrl, {
                 caption: payload.caption,
                 parse_mode: 'HTML',
                 reply_markup: { inline_keyboard: payload.inlineKeyboard },
-              },
-            ),
-          );
-          return {
-            fileId: msg.photo?.at(-1)?.file_id ?? null,
-            messageId: msg.message_id,
-          };
-        } catch (retryErr) {
-          logger.warn(
-            `sendPhoto retry failed for channel ${chatId} (${errorMessage(retryErr)}); falling back to sendMessage`,
-          );
+              }),
+              SEND_PHOTO_TIMEOUT_MS,
+              'sendPhoto(url)',
+            );
+            return {
+              fileId: msg.photo?.at(-1)?.file_id ?? null,
+              messageId: msg.message_id,
+            };
+          } catch (urlErr) {
+            logger.warn(
+              `URL sendPhoto fallback failed for channel ${chatId} (${errorMessage(urlErr)}); using large media preview in single message`,
+            );
+          }
         }
       }
     }
 
+    const fallbackCardUrl =
+      payload.cardImageUrl ??
+      (payload.cardImageUrlPromise ? await payload.cardImageUrlPromise : null);
     const msgId = await this.sendChannelTextImmediate(
       chatId,
       payload.caption,
       payload.inlineKeyboard,
+      fallbackCardUrl,
     );
     return { fileId: null, messageId: msgId };
   }
 
   /**
-   * Uploads the PNG card to catbox.moe in the background (so X/TG share links embed
-   * the card image), updates the channel post's share buttons, and dispatches the
-   * single unified message to matching DM subscribers.
+   * Uploads the PNG card in the background (so X/TG share links embed the card image),
+   * updates the channel post's share buttons, and dispatches the single unified message
+   * to matching DM subscribers.
    */
   private async finishShareUploadAndDms(
     launch: TokenLaunch,
@@ -316,14 +373,17 @@ export class TelegramNotifier implements Notifier {
     cachedPhotoFileId: string | null,
     channelMessageId: number | null,
   ): Promise<void> {
-    const uploadPromise = basePayload.pngBuffer
-      ? uploadLaunchCardImage(basePayload.pngBuffer)
-      : Promise.resolve(null);
+    const uploadPromise =
+      basePayload.cardImageUrlPromise ??
+      (basePayload.pngBuffer
+        ? uploadLaunchCardImage(basePayload.pngBuffer)
+        : Promise.resolve(null));
 
     // Dispatch to DM subscribers immediately using Telegram's cached file_id
     await this.dispatchToSubscribers(launch, basePayload, cachedPhotoFileId);
 
     const cardImageUrl = await uploadPromise;
+    basePayload.cardImageUrl = cardImageUrl;
     if (cardImageUrl && this.postToChannel && this.channelId && channelMessageId) {
       const updatedKeyboard = buildLaunchInlineKeyboard(launch, {
         ...this.formatOptions,
@@ -361,6 +421,10 @@ export class TelegramNotifier implements Notifier {
       }
     }
 
+    const cardImageUrlPromise = pngBuffer
+      ? uploadLaunchCardImage(pngBuffer)
+      : Promise.resolve(null);
+
     const optsWithCard: FormatOptions = {
       ...this.formatOptions,
       cardImageUrl,
@@ -371,6 +435,7 @@ export class TelegramNotifier implements Notifier {
       filename,
       caption: formatGraduatedMessage(graduation, optsWithCard),
       inlineKeyboard: buildGraduatedInlineKeyboard(graduation, optsWithCard),
+      cardImageUrlPromise,
     };
 
     let cachedPhotoFileId: string | null = null;
@@ -454,11 +519,20 @@ export class TelegramNotifier implements Notifier {
     chatId: string | number,
     caption: string,
     inlineKeyboard: { text: string; url: string }[][],
+    cardImageUrl?: string | null,
   ): Promise<number | null> {
+    const linkPreview = cardImageUrl
+      ? {
+          is_disabled: false,
+          url: cardImageUrl,
+          prefer_large_media: true,
+          show_above_text: true,
+        }
+      : { is_disabled: true };
     try {
       const msg = await this.bot.telegram.sendMessage(chatId, caption, {
         parse_mode: 'HTML',
-        link_preview_options: { is_disabled: true },
+        link_preview_options: linkPreview,
         reply_markup: { inline_keyboard: inlineKeyboard },
       });
       return msg.message_id;
@@ -470,7 +544,7 @@ export class TelegramNotifier implements Notifier {
           .replace(/&gt;/g, '>')
           .replace(/&amp;/g, '&');
         const msg = await this.bot.telegram.sendMessage(chatId, plainText, {
-          link_preview_options: { is_disabled: true },
+          link_preview_options: linkPreview,
           reply_markup: { inline_keyboard: inlineKeyboard },
         });
         return msg.message_id;
@@ -479,7 +553,7 @@ export class TelegramNotifier implements Notifier {
       const msg = await this.withRetry(() =>
         this.bot.telegram.sendMessage(chatId, caption, {
           parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
+          link_preview_options: linkPreview,
           reply_markup: { inline_keyboard: inlineKeyboard },
         }),
       );
@@ -583,26 +657,67 @@ export class TelegramNotifier implements Notifier {
           ? existingFileId
           : Input.fromBuffer(payload.pngBuffer, payload.filename);
         const msg = await this.withRetry(() =>
-          this.bot.telegram.sendPhoto(chatId, photoInput, {
-            caption: payload.caption,
-            parse_mode: 'HTML',
-            reply_markup: { inline_keyboard: payload.inlineKeyboard },
-          }),
+          withSendTimeout(
+            this.bot.telegram.sendPhoto(chatId, photoInput, {
+              caption: payload.caption,
+              parse_mode: 'HTML',
+              reply_markup: { inline_keyboard: payload.inlineKeyboard },
+            }),
+            SEND_PHOTO_TIMEOUT_MS,
+            'deliverPayload.sendPhoto(buffer)',
+          ),
         );
         const largestPhoto = msg.photo?.at(-1);
         return largestPhoto?.file_id ?? existingFileId;
       } catch (err) {
         logger.warn(
-          `sendPhoto failed for chat ${chatId} (${errorMessage(err)}); falling back to sendMessage`,
+          `sendPhoto failed for chat ${chatId} (${errorMessage(err)}); trying URL sendPhoto fallback`,
         );
+        const cardUrl =
+          payload.cardImageUrl ??
+          (payload.cardImageUrlPromise ? await payload.cardImageUrlPromise : null);
+        if (cardUrl) {
+          payload.cardImageUrl = cardUrl;
+          try {
+            const msg = await this.withRetry(() =>
+              withSendTimeout(
+                this.bot.telegram.sendPhoto(chatId, cardUrl, {
+                  caption: payload.caption,
+                  parse_mode: 'HTML',
+                  reply_markup: { inline_keyboard: payload.inlineKeyboard },
+                }),
+                SEND_PHOTO_TIMEOUT_MS,
+                'deliverPayload.sendPhoto(url)',
+              ),
+            );
+            const largestPhoto = msg.photo?.at(-1);
+            return largestPhoto?.file_id ?? existingFileId;
+          } catch (urlErr) {
+            logger.warn(
+              `URL sendPhoto failed for chat ${chatId} (${errorMessage(urlErr)}); falling back to sendMessage`,
+            );
+          }
+        }
       }
     }
+
+    const fallbackCardUrl =
+      payload.cardImageUrl ??
+      (payload.cardImageUrlPromise ? await payload.cardImageUrlPromise : null);
+    const linkPreview = fallbackCardUrl
+      ? {
+          is_disabled: false,
+          url: fallbackCardUrl,
+          prefer_large_media: true,
+          show_above_text: true,
+        }
+      : { is_disabled: true };
 
     try {
       await this.withRetry(() =>
         this.bot.telegram.sendMessage(chatId, payload.caption, {
           parse_mode: 'HTML',
-          link_preview_options: { is_disabled: true },
+          link_preview_options: linkPreview,
           reply_markup: { inline_keyboard: payload.inlineKeyboard },
         }),
       );
@@ -615,7 +730,7 @@ export class TelegramNotifier implements Notifier {
           .replace(/&amp;/g, '&');
         await this.withRetry(() =>
           this.bot.telegram.sendMessage(chatId, plainText, {
-            link_preview_options: { is_disabled: true },
+            link_preview_options: linkPreview,
             reply_markup: { inline_keyboard: payload.inlineKeyboard },
           }),
         );
@@ -638,6 +753,18 @@ export class TelegramNotifier implements Notifier {
    */
   async startCommandListener(watcher: LaunchWatcher): Promise<void> {
     if (this.commandsLaunched) return;
+
+    // Auto-register any user interacting in a private DM so they are subscribed even after a container redeploy
+    this.bot.use(async (ctx, next) => {
+      if (ctx.chat?.type === 'private' && this.userStore) {
+        try {
+          await this.userStore.getOrCreate(ctx.chat.id, extractUserLabel(ctx));
+        } catch {
+          // Ignore non-fatal store error in middleware
+        }
+      }
+      return next();
+    });
 
     // /start — Subscribe user & show welcome + personal filter settings
     this.bot.command('start', async (ctx) => {

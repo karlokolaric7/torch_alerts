@@ -4,8 +4,13 @@
  * starts interactive Telegram bot commands, optional HTTP health-check server + heartbeat log,
  * and handles graceful shutdown / clean crash recovery for 24/7 Render deployment.
  */
+import dns from 'node:dns';
 import http from 'node:http';
 import { loadConfig, ConfigError } from './config';
+
+// Force IPv4-first DNS resolution so large Telegram multipart uploads (sendPhoto)
+// never hang on cloud container IPv6 PMTUD blackholes (e.g. Render).
+dns.setDefaultResultOrder('ipv4first');
 import { logger, errorMessage } from './logger';
 import { StateStore } from './store/stateStore';
 import { UserFilterStore } from './store/userFilterStore';

@@ -112,7 +112,32 @@ export function describeUserFilters(prefs: UserFilterPrefs): string {
   return parts.length > 0 ? parts.join(' · ') : 'Default (receiving all launches & >=10x graduations)';
 }
 
+const DEFAULT_SUBSCRIBERS: Array<{ chatId: number; username?: string }> = [
+  { chatId: 5036738044, username: '@bajosinac' },
+];
+
+function getSeedSubscribers(resolvedPath: string): Array<{ chatId: number; username?: string }> {
+  // Don't seed default subscribers into isolated /tmp/ unit test stores
+  if (resolvedPath.startsWith('/tmp/') || resolvedPath.includes('torch-test-')) {
+    return [];
+  }
+  const seeds = [...DEFAULT_SUBSCRIBERS];
+  const rawEnv = process.env.DEFAULT_SUBSCRIBER_IDS?.trim();
+  if (rawEnv) {
+    for (const part of rawEnv.split(',')) {
+      const id = Number(part.trim());
+      if (Number.isInteger(id) && id > 0 && !seeds.some((s) => s.chatId === id)) {
+        seeds.push({ chatId: id });
+      }
+    }
+  }
+  return seeds;
+}
+
 export class UserFilterStore {
+  private saveChain: Promise<void> = Promise.resolve();
+  private saveSeq = 0;
+
   private constructor(
     private readonly filePath: string,
     private readonly users: Map<number, UserFilterPrefs>,
@@ -120,10 +145,15 @@ export class UserFilterStore {
 
   static async load(filePath: string): Promise<UserFilterStore> {
     const resolved = path.resolve(filePath);
+    const map = new Map<number, UserFilterPrefs>();
+
+    for (const seed of getSeedSubscribers(resolved)) {
+      map.set(seed.chatId, createDefaultUserPrefs(seed.chatId, seed.username));
+    }
+
     try {
       const raw = await fs.readFile(resolved, 'utf8');
       const parsed = JSON.parse(raw) as Partial<PersistedUsers>;
-      const map = new Map<number, UserFilterPrefs>();
       for (const u of parsed.users ?? []) {
         if (typeof u.chatId === 'number') {
           map.set(u.chatId, {
@@ -138,11 +168,13 @@ export class UserFilterStore {
       return new UserFilterStore(resolved, map);
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
-        logger.info(`No user filter file at ${resolved}, starting with empty user store`);
-        return new UserFilterStore(resolved, new Map());
+        logger.info(
+          `No user filter file at ${resolved}, initialized with ${map.size} default subscriber(s)`,
+        );
+        return new UserFilterStore(resolved, map);
       }
-      logger.warn(`Failed to parse user filter file ${resolved}, starting empty: ${(err as Error).message}`);
-      return new UserFilterStore(resolved, new Map());
+      logger.warn(`Failed to parse user filter file ${resolved}, starting with defaults: ${(err as Error).message}`);
+      return new UserFilterStore(resolved, map);
     }
   }
 
@@ -204,12 +236,18 @@ export class UserFilterStore {
   }
 
   async save(): Promise<void> {
+    const next = this.saveChain.then(() => this.writeToDisk());
+    this.saveChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private async writeToDisk(): Promise<void> {
     const data: PersistedUsers = {
       version: 1,
       users: [...this.users.values()],
     };
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.tmp`;
+    const tmp = `${this.filePath}.${process.pid}.${++this.saveSeq}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(data, null, 2), 'utf8');
     await fs.rename(tmp, this.filePath);
   }
