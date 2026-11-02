@@ -109,16 +109,25 @@ async function main(): Promise<void> {
     await telegramNotifier.startCommandListener(watcher);
   }
 
-  // Graceful shutdown: stop polling, stop bot commands, flush state, close the provider.
+  // Graceful shutdown: immediately stop Telegram polling, flush state to disk, and exit cleanly
+  // so old containers on Render never linger or conflict (409) with newly deployed containers.
   let shuttingDown = false;
   const shutdown = async (signal: string) => {
     if (shuttingDown) return;
     shuttingDown = true;
-    logger.info(`Received ${signal}, shutting down...`);
+    logger.info(`Received ${signal}, shutting down immediately...`);
     clearInterval(heartbeatTimer);
     healthServer?.close();
+    stopEthPriceRefresher();
     telegramNotifier?.stopCommandListener(signal);
     watcher.stop();
+
+    await Promise.allSettled([
+      store.save().catch((err) => logger.error(`Failed to save state: ${errorMessage(err)}`)),
+      userStore.save().catch((err) => logger.error(`Failed to save user filters: ${errorMessage(err)}`)),
+    ]);
+    watcher.destroyProvider();
+    process.exit(0);
   };
   process.once('SIGINT', () => void shutdown('SIGINT'));
   process.once('SIGTERM', () => void shutdown('SIGTERM'));

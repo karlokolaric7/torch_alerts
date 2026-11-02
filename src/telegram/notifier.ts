@@ -159,6 +159,7 @@ export class TelegramNotifier implements Notifier {
   private readonly userStore?: UserFilterStore;
   private lastPostAt = 0;
   private commandsLaunched = false;
+  private commandReconnectTimer: NodeJS.Timeout | null = null;
   private readonly pendingTasks = new Set<Promise<void>>();
 
   constructor(
@@ -1211,15 +1212,17 @@ export class TelegramNotifier implements Notifier {
     this.commandsLaunched = true;
     const launchPollingWithRetry = () => {
       if (!this.commandsLaunched) return;
+      this.commandReconnectTimer = null;
       void this.bot
         .launch({ dropPendingUpdates: true })
         .catch((err) => {
           if (!this.commandsLaunched) return;
+          const jitterMs = 5_000 + Math.floor(Math.random() * 4_000);
           logger.warn(
-            `Telegram command listener interrupted (${errorMessage(err)}); reconnecting in 5s...`,
+            `Telegram command listener interrupted (${errorMessage(err)}); reconnecting in ${jitterMs}ms...`,
           );
-          const timer = setTimeout(launchPollingWithRetry, 5_000);
-          timer.unref?.();
+          this.commandReconnectTimer = setTimeout(launchPollingWithRetry, jitterMs);
+          this.commandReconnectTimer.unref?.();
         });
     };
     launchPollingWithRetry();
@@ -1229,8 +1232,11 @@ export class TelegramNotifier implements Notifier {
   }
 
   stopCommandListener(signal = 'SIGTERM'): void {
-    if (!this.commandsLaunched) return;
     this.commandsLaunched = false;
+    if (this.commandReconnectTimer) {
+      clearTimeout(this.commandReconnectTimer);
+      this.commandReconnectTimer = null;
+    }
     try {
       this.bot.stop(signal);
     } catch {
