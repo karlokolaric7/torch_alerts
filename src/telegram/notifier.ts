@@ -1275,22 +1275,18 @@ export class TelegramNotifier implements Notifier {
           if (!this.commandsLaunched) return;
           const msg = errorMessage(err);
           const uptimeSec = Math.round((Date.now() - listenerStartedAtMs) / 1000);
-          // If this container has already been running (>45s) and gets a 409 Conflict,
-          // a newer Render deploy has started and taken over getUpdates. Yield immediately
-          // and exit so the old container never fights the new deploy.
-          if (/409|conflict/i.test(msg) && uptimeSec > 45) {
-            logger.info(
-              `Newer bot instance connected (409 Conflict after ${uptimeSec}s uptime); yielding and shutting down old instance.`,
+          const jitterMs = 8_000 + Math.floor(Math.random() * 5_000);
+          // During Render's ~3-minute rolling deploy handover, two containers briefly overlap.
+          // Reconnect quietly without exiting the process so Render never flags an early exit.
+          if (/409|conflict/i.test(msg) && uptimeSec < 210) {
+            logger.debug(
+              `Telegram command listener handover (409 Conflict at ${uptimeSec}s uptime); retrying in ${jitterMs}ms...`,
             );
-            this.stopCommandListener('SIGTERM');
-            watcher.stop();
-            setTimeout(() => process.exit(0), 500).unref?.();
-            return;
+          } else {
+            logger.warn(
+              `Telegram command listener interrupted (${msg}); reconnecting in ${jitterMs}ms...`,
+            );
           }
-          const jitterMs = 6_000 + Math.floor(Math.random() * 4_000);
-          logger.warn(
-            `Telegram command listener interrupted (${msg}); reconnecting in ${jitterMs}ms...`,
-          );
           this.commandReconnectTimer = setTimeout(launchPollingWithRetry, jitterMs);
           this.commandReconnectTimer.unref?.();
         });
