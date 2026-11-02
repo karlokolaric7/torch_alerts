@@ -80,13 +80,19 @@ function normalizeChannelId(raw: string): string {
     return `-${trimmed}`;
   }
   const tmeMatch = trimmed.match(/^(?:https?:\/\/)?t\.me\/(?:s\/)?([A-Za-z0-9_]+)\/?$/i);
-  if (tmeMatch && !tmeMatch[1].startsWith('+')) {
-    return `@${tmeMatch[1]}`;
+  const candidate =
+    tmeMatch && !tmeMatch[1].startsWith('+')
+      ? `@${tmeMatch[1]}`
+      : !trimmed.startsWith('@') && !/^-?\d+$/.test(trimmed) && /^[A-Za-z0-9_]{4,}$/.test(trimmed)
+        ? `@${trimmed}`
+        : trimmed;
+
+  // Map legacy @torch_alerts_test username (renamed to @torch_ecosystem_talks / "Light_the_Torch")
+  // to its permanent numeric channel ID (-1003986982427) so username renames never break posting.
+  if (candidate.toLowerCase() === '@torch_alerts_test') {
+    return '-1003986982427';
   }
-  if (!trimmed.startsWith('@') && !/^-?\d+$/.test(trimmed) && /^[A-Za-z0-9_]{4,}$/.test(trimmed)) {
-    return `@${trimmed}`;
-  }
-  return trimmed;
+  return candidate;
 }
 
 function required(name: string): string {

@@ -18,7 +18,7 @@
  */
 import dns from 'node:dns';
 import https from 'node:https';
-import { Input, Telegraf, TelegramError, type Context } from 'telegraf';
+import { Telegraf, TelegramError, type Context } from 'telegraf';
 import { logger, errorMessage } from '../logger';
 
 // Force IPv4-first DNS & HTTPS agent so large multipart sendPhoto uploads never hit
@@ -163,8 +163,8 @@ export class TelegramNotifier implements Notifier {
   private readonly pendingTasks = new Set<Promise<void>>();
 
   constructor(
-    token: string,
-    private readonly channelId: string,
+    private readonly token: string,
+    private channelId: string,
     private readonly formatOptions: TelegramNotifierOptions = {},
   ) {
     this.bot = new Telegraf(token, {
@@ -184,7 +184,9 @@ export class TelegramNotifier implements Notifier {
       try {
         const chat = await this.bot.telegram.getChat(this.channelId);
         const title = 'title' in chat ? chat.title : this.channelId;
-        logger.info(`Posting to Telegram channel "${title}" (${chat.id})`);
+        // Lock onto the permanent numeric chat.id so future channel @username renames never break posting.
+        this.channelId = String(chat.id);
+        logger.info(`Posting to Telegram channel "${title}" (${this.channelId})`);
       } catch (err) {
         throw new Error(
           `Bot cannot access TELEGRAM_CHANNEL_ID=${this.channelId}. ` +
@@ -241,37 +243,43 @@ export class TelegramNotifier implements Notifier {
     let channelMessageId: number | null = null;
 
     if (this.postToChannel && this.channelId) {
-      const delivered = await this.deliverChannelUnifiedImmediate(
-        this.channelId,
-        initialPayload,
-      );
-      cachedPhotoFileId = delivered.fileId;
-      channelMessageId = delivered.messageId;
+      try {
+        const delivered = await this.deliverChannelUnifiedImmediate(
+          this.channelId,
+          initialPayload,
+        );
+        cachedPhotoFileId = delivered.fileId;
+        channelMessageId = delivered.messageId;
 
-      const channelSentAtMs = Date.now();
-      this.lastPostAt = channelSentAtMs;
+        const channelSentAtMs = Date.now();
+        this.lastPostAt = channelSentAtMs;
 
-      const onChainIso = new Date(launch.timestamp * 1000).toISOString();
-      const receivedIso = launch.detectedAtMs
-        ? new Date(launch.detectedAtMs).toISOString()
-        : new Date(postStartMs).toISOString();
-      const sentIso = new Date(channelSentAtMs).toISOString();
-      const enrichMs =
-        launch.detectedAtMs && launch.enrichedAtMs
-          ? launch.enrichedAtMs - launch.detectedAtMs
-          : 0;
-      const tgSendMs = channelSentAtMs - postStartMs - renderMs;
-      const eventToChannelMs = launch.detectedAtMs
-        ? channelSentAtMs - launch.detectedAtMs
-        : channelSentAtMs - postStartMs;
-      const totalFromChainMs = channelSentAtMs - launch.timestamp * 1000;
+        const onChainIso = new Date(launch.timestamp * 1000).toISOString();
+        const receivedIso = launch.detectedAtMs
+          ? new Date(launch.detectedAtMs).toISOString()
+          : new Date(postStartMs).toISOString();
+        const sentIso = new Date(channelSentAtMs).toISOString();
+        const enrichMs =
+          launch.detectedAtMs && launch.enrichedAtMs
+            ? launch.enrichedAtMs - launch.detectedAtMs
+            : 0;
+        const tgSendMs = channelSentAtMs - postStartMs - renderMs;
+        const eventToChannelMs = launch.detectedAtMs
+          ? channelSentAtMs - launch.detectedAtMs
+          : channelSentAtMs - postStartMs;
+        const totalFromChainMs = channelSentAtMs - launch.timestamp * 1000;
 
-      logger.info(
-        `[CHANNEL-POSTED] $${launch.symbol ?? '?'} (${launch.name ?? '?'}) CA=${launch.address} ` +
-          `mcap=${formatMarketCapDisplay(launch) ?? '?'} tax=${launch.buyTaxPct ?? '?'}% -> ${this.channelId} | ` +
-          `onChain=${onChainIso} eventReceived=${receivedIso} channelSent=${sentIso} | ` +
-          `eventToChannel=${eventToChannelMs}ms (enrich=${enrichMs}ms, render=${renderMs}ms, tgSend=${tgSendMs}ms, totalFromChain=${totalFromChainMs}ms)`,
-      );
+        logger.info(
+          `[CHANNEL-POSTED] $${launch.symbol ?? '?'} (${launch.name ?? '?'}) CA=${launch.address} ` +
+            `mcap=${formatMarketCapDisplay(launch) ?? '?'} tax=${launch.buyTaxPct ?? '?'}% -> ${this.channelId} | ` +
+            `onChain=${onChainIso} eventReceived=${receivedIso} channelSent=${sentIso} | ` +
+            `eventToChannel=${eventToChannelMs}ms (enrich=${enrichMs}ms, render=${renderMs}ms, tgSend=${tgSendMs}ms, totalFromChain=${totalFromChainMs}ms)`,
+        );
+      } catch (err) {
+        logger.error(
+          `Failed to post launch $${launch.symbol ?? '?'} (${launch.address}) to channel ${this.channelId}: ${errorMessage(err)} (continuing with DM dispatch)`,
+        );
+      }
     }
 
     // Run external share-host upload + subscriber DMs in the background so the watcher never stalls.
@@ -288,9 +296,52 @@ export class TelegramNotifier implements Notifier {
   }
 
   /**
+   * Uploads a PNG buffer directly to Telegram's `sendPhoto` endpoint using Node's
+   * native `fetch` + `FormData` + `Blob` (which sets an explicit `Content-Length`
+   * header instead of Telegraf's `node-fetch@2` chunked `MultipartStream` that
+   * stalls on Render's egress proxy).
+   */
+  private async sendPhotoBufferNative(
+    chatId: string | number,
+    pngBuffer: Buffer,
+    filename: string,
+    caption: string,
+    inlineKeyboard: { text: string; url: string }[][],
+  ): Promise<{ fileId: string | null; messageId: number }> {
+    const form = new FormData();
+    form.append('chat_id', String(chatId));
+    form.append('photo', new Blob([new Uint8Array(pngBuffer)], { type: 'image/png' }), filename);
+    form.append('caption', caption);
+    form.append('parse_mode', 'HTML');
+    form.append('reply_markup', JSON.stringify({ inline_keyboard: inlineKeyboard }));
+
+    const res = await withSendTimeout(
+      fetch(`https://api.telegram.org/bot${this.token}/sendPhoto`, {
+        method: 'POST',
+        body: form,
+      }),
+      SEND_PHOTO_TIMEOUT_MS,
+      'sendPhoto(native)',
+    );
+    const data = (await res.json()) as {
+      ok: boolean;
+      description?: string;
+      error_code?: number;
+      result?: { message_id: number; photo?: Array<{ file_id: string }> };
+    };
+    if (!data.ok || !data.result) {
+      throw new Error(`${data.error_code ?? res.status}: ${data.description ?? 'sendPhoto failed'}`);
+    }
+    return {
+      fileId: data.result.photo?.at(-1)?.file_id ?? null,
+      messageId: data.result.message_id,
+    };
+  }
+
+  /**
    * Sends the unified single-message alert (PNG card + HTML caption + inline buttons)
    * to the public channel immediately:
-   *  1. Tries direct buffer `sendPhoto` over IPv4 (10s timeout).
+   *  1. Tries native `fetch` + `FormData` `sendPhoto` (explicit Content-Length, ~300ms).
    *  2. If multipart buffer upload fails or times out, uses the hosted `cardImageUrl`
    *     with `sendPhoto(chatId, cardImageUrl)` so Telegram's servers attach the photo directly.
    *  3. If `sendPhoto` is still rejected, sends `sendMessage` with `prefer_large_media`
@@ -302,23 +353,13 @@ export class TelegramNotifier implements Notifier {
   ): Promise<{ fileId: string | null; messageId: number | null }> {
     if (payload.pngBuffer) {
       try {
-        const msg = await withSendTimeout(
-          this.bot.telegram.sendPhoto(
-            chatId,
-            Input.fromBuffer(payload.pngBuffer, payload.filename),
-            {
-              caption: payload.caption,
-              parse_mode: 'HTML',
-              reply_markup: { inline_keyboard: payload.inlineKeyboard },
-            },
-          ),
-          SEND_PHOTO_TIMEOUT_MS,
-          'sendPhoto(buffer)',
+        return await this.sendPhotoBufferNative(
+          chatId,
+          payload.pngBuffer,
+          payload.filename,
+          payload.caption,
+          payload.inlineKeyboard,
         );
-        return {
-          fileId: msg.photo?.at(-1)?.file_id ?? null,
-          messageId: msg.message_id,
-        };
       } catch (err) {
         logger.warn(
           `Immediate buffer sendPhoto failed for channel ${chatId} (${errorMessage(err)}); trying URL sendPhoto fallback`,
@@ -443,11 +484,17 @@ export class TelegramNotifier implements Notifier {
 
     // 1. Post to public channel once when the token first crosses the global ~10x graduation mark
     if (graduation.isFirstChannelGraduation && this.postToChannel && this.channelId) {
-      cachedPhotoFileId = await this.deliverPayload(this.channelId, payload, cachedPhotoFileId);
-      logger.info(
-        `[GRADUATED-CHANNEL-POSTED] $${graduation.symbol ?? '?'} (${graduation.name ?? '?'}) CA=${graduation.address} ` +
-          `multiple=${graduation.multiple.toFixed(2)}x mcap=${graduation.currentMarketCapQuote.toFixed(2)} ${graduation.quoteSymbol} -> ${this.channelId}`,
-      );
+      try {
+        cachedPhotoFileId = await this.deliverPayload(this.channelId, payload, cachedPhotoFileId);
+        logger.info(
+          `[GRADUATED-CHANNEL-POSTED] $${graduation.symbol ?? '?'} (${graduation.name ?? '?'}) CA=${graduation.address} ` +
+            `multiple=${graduation.multiple.toFixed(2)}x mcap=${graduation.currentMarketCapQuote.toFixed(2)} ${graduation.quoteSymbol} -> ${this.channelId}`,
+        );
+      } catch (err) {
+        logger.error(
+          `Failed to post graduation $${graduation.symbol ?? '?'} (${graduation.address}) to channel ${this.channelId}: ${errorMessage(err)} (continuing with DM dispatch)`,
+        );
+      }
     }
 
     // 2. Check each subscribed user's graduation preferences (/graduated, /setminx)
@@ -654,22 +701,30 @@ export class TelegramNotifier implements Notifier {
   ): Promise<string | null> {
     if (payload.pngBuffer) {
       try {
-        const photoInput = existingFileId
-          ? existingFileId
-          : Input.fromBuffer(payload.pngBuffer, payload.filename);
-        const msg = await this.withRetry(() =>
-          withSendTimeout(
-            this.bot.telegram.sendPhoto(chatId, photoInput, {
-              caption: payload.caption,
-              parse_mode: 'HTML',
-              reply_markup: { inline_keyboard: payload.inlineKeyboard },
-            }),
-            SEND_PHOTO_TIMEOUT_MS,
-            'deliverPayload.sendPhoto(buffer)',
+        if (existingFileId) {
+          const msg = await this.withRetry(() =>
+            withSendTimeout(
+              this.bot.telegram.sendPhoto(chatId, existingFileId, {
+                caption: payload.caption,
+                parse_mode: 'HTML',
+                reply_markup: { inline_keyboard: payload.inlineKeyboard },
+              }),
+              SEND_PHOTO_TIMEOUT_MS,
+              'deliverPayload.sendPhoto(fileId)',
+            ),
+          );
+          return msg.photo?.at(-1)?.file_id ?? existingFileId;
+        }
+        const sent = await this.withRetry(() =>
+          this.sendPhotoBufferNative(
+            chatId,
+            payload.pngBuffer!,
+            payload.filename,
+            payload.caption,
+            payload.inlineKeyboard,
           ),
         );
-        const largestPhoto = msg.photo?.at(-1);
-        return largestPhoto?.file_id ?? existingFileId;
+        return sent.fileId ?? existingFileId;
       } catch (err) {
         logger.warn(
           `sendPhoto failed for chat ${chatId} (${errorMessage(err)}); trying URL sendPhoto fallback`,
