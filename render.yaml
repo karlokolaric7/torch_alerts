@@ -1,0 +1,42 @@
+services:
+  - type: worker
+    name: torch-alerts-bot
+    runtime: node
+    plan: starter
+    buildCommand: npm install && npm run build
+    startCommand: npm start
+    envVars:
+      - key: NODE_ENV
+        value: production
+      - key: RPC_URL
+        value: https://rpc.mainnet.chain.robinhood.com
+      - key: TELEGRAM_BOT_TOKEN
+        sync: false
+      - key: TELEGRAM_CHANNEL_ID
+        sync: false
+      - key: POST_TO_CHANNEL
+        value: "true"
+      - key: FACTORY_ADDRESS
+        value: "0x7891eA889899928aFE637e4Cca8106188427776a"
+      - key: TOKEN_SUFFIX
+        value: "1111"
+      - key: LAUNCH_EVENT_TOPIC
+        value: "0xea6baf14ec1f4c08d18114c1eea0e6a2a018eef994f9db19ea8a41526e49d28c"
+      - key: POOL_MANAGER_ADDRESS
+        value: "0x8366a39CC670B4001A1121B8F6A443A643e40951"
+      - key: ENABLE_GRADUATION_ALERTS
+        value: "true"
+      - key: GRADUATION_MULTIPLIER
+        value: "10"
+      - key: GRADUATION_CHECK_INTERVAL_MS
+        value: "2400"
+      - key: POLL_INTERVAL_MS
+        value: "600"
+      - key: EXPLORER_URL
+        value: https://robinhoodchain.blockscout.com
+      - key: TOKEN_URL_TEMPLATE
+        value: https://app.torchpad.fun/trade/robinhood/{address}
+      - key: INCLUDE_IMAGE_CARD
+        value: "true"
+      - key: ENABLE_BOT_COMMANDS
+        value: "true"

@@ -1,0 +1,31 @@
+{
+  "name": "torch-alerts",
+  "version": "0.1.0",
+  "description": "Detects new token launches on the Torch launchpad (Robinhood Chain) and posts alerts to a Telegram channel.",
+  "main": "dist/index.js",
+  "private": true,
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.17"
+  },
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx src/index.ts",
+    "inspect": "tsx src/scripts/inspect.ts",
+    "test-alert": "tsx src/scripts/testAlert.ts",
+    "typecheck": "tsc -p tsconfig.json --noEmit",
+    "test": "tsx --test test/*.test.ts"
+  },
+  "dependencies": {
+    "@types/node": "^22.9.0",
+    "dotenv": "^16.4.5",
+    "ethers": "^6.13.4",
+    "sharp": "^0.35.5",
+    "telegraf": "^4.16.3",
+    "typescript": "^5.6.3"
+  },
+  "devDependencies": {
+    "tsx": "^4.19.2"
+  }
+}
