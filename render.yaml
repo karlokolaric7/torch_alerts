@@ -40,3 +40,4 @@ services:
         value: "true"
       - key: ENABLE_BOT_COMMANDS
         value: "true"
+

@@ -49,16 +49,34 @@ npm start              # run compiled production build (node dist/index.js)
 npm test               # run unit tests
 ```
 
-## Deploying to Render (Background Worker)
+## Deploying to Render (24/7 Background Worker)
 
-1. Push this repository to GitHub.
-2. In the [Render Dashboard](https://dashboard.render.com/), click **New +** → **Background Worker** (or **Blueprint** to auto-import [`render.yaml`](./render.yaml)).
-3. Connect your GitHub repository and configure:
+Repository: `https://github.com/karlokolaric7/torch_alerts`
+
+### Option A: Manual Background Worker Setup in Render
+1. Open the [Render Dashboard](https://dashboard.render.com/) and click **New +** → **Background Worker**.
+2. Connect your GitHub account and select **`karlokolaric7/torch_alerts`**.
+3. Configure the worker settings:
+   - **Name**: `torch-alerts-bot`
+   - **Branch**: `main`
    - **Runtime**: `Node`
    - **Build Command**: `npm install && npm run build`
    - **Start Command**: `npm start`
-4. Add the required Environment Variables in Render:
-   - `RPC_URL` = `https://rpc.mainnet.chain.robinhood.com`
-   - `TELEGRAM_BOT_TOKEN` = `<your BotFather token>`
-   - `TELEGRAM_CHANNEL_ID` = `@your_channel` (or numeric `-100...` ID)
-   - *(Optional)* Any filter or runtime variables from [`.env.example`](./.env.example).
+4. Under **Environment Variables**, add the required variables:
+   | Key | Value / Placeholder | Required |
+   | --- | --- | --- |
+   | `RPC_URL` | `https://rpc.mainnet.chain.robinhood.com` | **Yes** |
+   | `TELEGRAM_BOT_TOKEN` | `<YOUR_TELEGRAM_BOT_TOKEN>` | **Yes** |
+   | `TELEGRAM_CHANNEL_ID` | `<YOUR_CHANNEL_USERNAME_OR_ID>` (e.g. `@torch_alerts_test` or `-1003986982427`) | **Yes** |
+   | `POST_TO_CHANNEL` | `true` | Optional (default `true`) |
+   | `POLL_INTERVAL_MS` | `600` | Optional (default `600`) |
+   | `ENABLE_GRADUATION_ALERTS` | `true` | Optional (default `true`) |
+   | `GRADUATION_MULTIPLIER` | `10` | Optional (default `10`) |
+   | `EXPLORER_URL` | `https://robinhoodchain.blockscout.com` | Optional |
+   | `TOKEN_URL_TEMPLATE` | `https://app.torchpad.fun/trade/robinhood/{address}` | Optional |
+5. Click **Create Background Worker**. Render will build the TypeScript code (`npm run build`), start the bot (`npm start`), and automatically restart it if it ever exits.
+
+### Option B: 1-Click Render Blueprint (`render.yaml`)
+1. In the Render Dashboard, click **New +** → **Blueprint**.
+2. Select **`karlokolaric7/torch_alerts`**. Render will read [`render.yaml`](./render.yaml) automatically.
+3. Paste your `TELEGRAM_BOT_TOKEN` and `TELEGRAM_CHANNEL_ID` when prompted and click **Apply**.
