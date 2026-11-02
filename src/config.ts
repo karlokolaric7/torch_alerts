@@ -67,6 +67,28 @@ function optional(name: string): string | undefined {
   return value ? value : undefined;
 }
 
+/**
+ * Normalizes TELEGRAM_CHANNEL_ID so common input formats all work seamlessly:
+ * - "1003986982427" -> "-1003986982427" (adds missing leading minus sign on numeric channel IDs)
+ * - "https://t.me/torch_alerts_test" or "t.me/torch_alerts_test" -> "@torch_alerts_test"
+ * - "torch_alerts_test" -> "@torch_alerts_test"
+ */
+function normalizeChannelId(raw: string): string {
+  const trimmed = raw.trim();
+  if (!trimmed) return '';
+  if (/^100\d{7,}$/.test(trimmed)) {
+    return `-${trimmed}`;
+  }
+  const tmeMatch = trimmed.match(/^(?:https?:\/\/)?t\.me\/(?:s\/)?([A-Za-z0-9_]+)\/?$/i);
+  if (tmeMatch && !tmeMatch[1].startsWith('+')) {
+    return `@${tmeMatch[1]}`;
+  }
+  if (!trimmed.startsWith('@') && !/^-?\d+$/.test(trimmed) && /^[A-Za-z0-9_]{4,}$/.test(trimmed)) {
+    return `@${trimmed}`;
+  }
+  return trimmed;
+}
+
 function required(name: string): string {
   const value = optional(name);
   if (!value) throw new ConfigError(`Missing required env var ${name} (see .env.example)`);
@@ -195,10 +217,11 @@ export function loadConfig(): Config {
     userFiltersFile: optional('USER_FILTERS_FILE') ?? './data/users.json',
     // Telegram credentials are only needed when actually posting.
     telegramBotToken: dryRun ? optional('TELEGRAM_BOT_TOKEN') ?? '' : required('TELEGRAM_BOT_TOKEN'),
-    telegramChannelId:
+    telegramChannelId: normalizeChannelId(
       dryRun || !postToChannel
         ? optional('TELEGRAM_CHANNEL_ID') ?? ''
         : required('TELEGRAM_CHANNEL_ID'),
+    ),
     verifyFreshDeploy: boolean('VERIFY_FRESH_DEPLOY', true),
     pollIntervalMs: integer('POLL_INTERVAL_MS', 600, 200),
     confirmations: integer('CONFIRMATIONS', 0, 0),

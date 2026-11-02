@@ -282,15 +282,28 @@ export class LaunchWatcher {
     }
   }
 
-  /** Decides where to start on first run (no saved lastBlock). */
+  /** Decides where to start on first run (or fast-forwards if saved state is stale after downtime). */
   private async initStartBlock(): Promise<void> {
-    if (this.store.lastBlock !== null) return;
+    const head = await withTimeout(this.provider.getBlockNumber(), RPC_TIMEOUT_MS, 'getBlockNumber');
+    const MAX_STARTUP_CATCHUP_BLOCKS = 600; // ~60s at 10 blocks/s
+
+    if (this.store.lastBlock !== null) {
+      const gap = head - this.store.lastBlock;
+      if (gap > MAX_STARTUP_CATCHUP_BLOCKS && this.config.startBlock === undefined) {
+        logger.info(
+          `Saved state lastBlock=${this.store.lastBlock} is ${gap} blocks behind chain head=${head}; ` +
+            `fast-forwarding to head to avoid replaying stale launches.`,
+        );
+        this.store.setLastBlock(head);
+        await this.store.save();
+      }
+      return;
+    }
 
     if (this.config.startBlock !== undefined) {
       this.store.setLastBlock(this.config.startBlock - 1);
     } else {
       // No backfill by default: only announce launches from now on.
-      const head = await withTimeout(this.provider.getBlockNumber(), RPC_TIMEOUT_MS, 'getBlockNumber');
       this.store.setLastBlock(head);
     }
     await this.store.save();

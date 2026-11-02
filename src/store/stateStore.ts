@@ -32,6 +32,8 @@ export class StateStore {
   private readonly inFlight = new Set<string>();
   private readonly trackedByPool = new Map<string, TrackedToken>();
   private readonly trackedByAddress = new Map<string, TrackedToken>();
+  private saveChain: Promise<void> = Promise.resolve();
+  private saveSeq = 0;
 
   private constructor(
     private readonly filePath: string,
@@ -250,6 +252,12 @@ export class StateStore {
   }
 
   async save(): Promise<void> {
+    const next = this.saveChain.then(() => this.writeToDisk());
+    this.saveChain = next.catch(() => undefined);
+    return next;
+  }
+
+  private async writeToDisk(): Promise<void> {
     const seenArr = [...this.seen];
     const seenTxsArr = [...this.seenTxs];
     const trackedArr = [...this.trackedByPool.values()].slice(-MAX_TRACKED_TOKENS);
@@ -261,7 +269,7 @@ export class StateStore {
       trackedTokens: trackedArr,
     };
     await fs.mkdir(path.dirname(this.filePath), { recursive: true });
-    const tmp = `${this.filePath}.tmp`;
+    const tmp = `${this.filePath}.${process.pid}.${++this.saveSeq}.tmp`;
     await fs.writeFile(tmp, JSON.stringify(state, null, 2), 'utf8');
     await fs.rename(tmp, this.filePath);
   }

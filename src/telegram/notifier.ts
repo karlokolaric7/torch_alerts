@@ -1082,13 +1082,20 @@ export class TelegramNotifier implements Notifier {
       .catch((err) => logger.warn(`Could not register bot command menu: ${errorMessage(err)}`));
 
     this.commandsLaunched = true;
-    // Start polling in the background (bot.launch() resolves only when stopped).
-    void this.bot
-      .launch({ dropPendingUpdates: true })
-      .catch((err) => {
-        this.commandsLaunched = false;
-        logger.warn(`Telegram command listener stopped: ${errorMessage(err)}`);
-      });
+    const launchPollingWithRetry = () => {
+      if (!this.commandsLaunched) return;
+      void this.bot
+        .launch({ dropPendingUpdates: true })
+        .catch((err) => {
+          if (!this.commandsLaunched) return;
+          logger.warn(
+            `Telegram command listener interrupted (${errorMessage(err)}); reconnecting in 5s...`,
+          );
+          const timer = setTimeout(launchPollingWithRetry, 5_000);
+          timer.unref?.();
+        });
+    };
+    launchPollingWithRetry();
     logger.info(
       'Telegram bot commands enabled (/setminmc, /setmaxtax, /antisnipe, /setmindevbuy, /graduated, /setminx, /filters, /resetfilters, /status, /latest, /help)',
     );

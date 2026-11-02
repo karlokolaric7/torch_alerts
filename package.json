@@ -10,7 +10,8 @@
   },
   "scripts": {
     "build": "tsc -p tsconfig.json",
-    "start": "node dist/index.js",
+    "prestart": "npm run build",
+    "start": "node --max-old-space-size=384 dist/index.js",
     "dev": "tsx src/index.ts",
     "inspect": "tsx src/scripts/inspect.ts",
     "test-alert": "tsx src/scripts/testAlert.ts",
